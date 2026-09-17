@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+python-dotenv
+paddlepaddle
+paddleocr[doc-parser]
+pytest
