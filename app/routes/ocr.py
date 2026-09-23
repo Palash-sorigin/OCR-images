@@ -1,157 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
-from app.config import MAX_IMAGE_BYTES
 from app.dependencies import get_ocr_service, get_pipeline
+from app.routes._shared import pipeline_lock as _pipeline_lock
+from app.routes._shared import save_upload as _save_upload
 
 
 router = APIRouter(tags=["OCR / Extraction"])
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-ALLOWED_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".bmp",
-    ".tif",
-    ".tiff",
-}
-
-ALLOWED_CONTENT_TYPES = {
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/webp",
-    "image/bmp",
-    "image/tiff",
-}
-
 MIN_IMAGES = 1
 MAX_IMAGES = 4
-
-
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-# Explicitly serialize OCR/model inference.
-#
-# Even if multiple HTTP requests arrive at the same time, only one OCR
-# pipeline is allowed to execute at a time.
-#
-# Inside /analyze, images are also processed one-by-one.
-# ---------------------------------------------------------------------------
-
-_pipeline_lock = asyncio.Lock()
-
-
-# ---------------------------------------------------------------------------
-# File validation
-# ---------------------------------------------------------------------------
-
-def _validate_extension(filename: str) -> str:
-    """
-    Validate the file extension and return it.
-    """
-
-    extension = Path(filename).suffix.lower()
-
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported image format: "
-                f"{extension or 'unknown'}. "
-                f"Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-            ),
-        )
-
-    return extension
-
-
-def _validate_content_type(file: UploadFile) -> None:
-    """
-    Validate MIME type when the client provides one.
-
-    Some clients may omit Content-Type, so an empty content type is allowed
-    and the extension check remains the fallback.
-    """
-
-    content_type = (file.content_type or "").lower()
-
-    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported content type for "
-                f"'{file.filename or 'image'}': {content_type}. "
-                f"Expected an image file."
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Save uploaded image temporarily
-# ---------------------------------------------------------------------------
-
-async def _save_upload(file: UploadFile) -> tuple[str, Path]:
-    """
-    Read an uploaded image into a temporary file.
-
-    Returns:
-        (original_filename, temporary_file_path)
-    """
-
-    filename = Path(file.filename or "image").name
-
-    # Validate extension
-    extension = _validate_extension(filename)
-
-    # Validate MIME type
-    _validate_content_type(file)
-
-    # Read one byte more than the allowed maximum so that we can detect
-    # oversized files without loading an unbounded amount of data.
-    data = await file.read(MAX_IMAGE_BYTES + 1)
-
-    if not data:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Empty image upload: {filename}",
-        )
-
-    if len(data) > MAX_IMAGE_BYTES:
-        max_mb = MAX_IMAGE_BYTES / (1024 * 1024)
-
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Image exceeds the maximum allowed size "
-                f"of {max_mb:.1f} MB: {filename}"
-            ),
-        )
-
-    # Create a temporary file.
-    #
-    # delete=False is required because the OCR service needs to open the
-    # file after this function returns.
-    with NamedTemporaryFile(
-        delete=False,
-        suffix=extension,
-    ) as temp:
-
-        temp.write(data)
-
-        return filename, Path(temp.name)
 
 
 # ---------------------------------------------------------------------------

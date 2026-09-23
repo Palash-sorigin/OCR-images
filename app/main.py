@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from app.config import ENABLE_VLM
 from app.dependencies import initialize_services, shutdown_services
+from app.routes.documents import router as documents_router
 from app.routes.ocr import router as ocr_router
 
 
@@ -29,6 +30,7 @@ app = FastAPI(
 )
 
 app.include_router(ocr_router)
+app.include_router(documents_router)
 
 
 @app.get("/health")

@@ -18,6 +18,13 @@ class ImageResult(BaseModel):
     status: str
     screen_type: str = "UNKNOWN"
     screen_confidence: float = 0.0
+    # Populated only by the document routes (EIR, Form 13, Visit Ticket,
+    # vehicle display, container seal); None for the portal/container
+    # pipeline. Kept separate from screen_type rather than overloading it,
+    # since screen_type has an established, specific meaning there
+    # (PIN_GENERATION_PSA, etc.).
+    document_type: str | None = None
+    document_subtype: str | None = None
     quality: dict[str, Any] = Field(default_factory=dict)
     fields: dict[str, FieldResult] = Field(default_factory=dict)
     tables: list[dict[str, Any]] = Field(default_factory=list)

@@ -2,7 +2,7 @@
 
 FastAPI service for a sequential **Extract → Validate → Review → Fill** workflow.
 
-The original project was a container-number OCR service. It now keeps that specialized container OCR as a reusable component and adds general portal screenshot extraction for PIN Generation and Truck Booking screens.
+The original project was a container-number OCR service. It now keeps that specialized container OCR as a reusable component, adds general portal screenshot extraction for PIN Generation and Truck Booking screens, and adds a second, VLM+OCR hybrid pipeline for fixed-schema logistics documents: EIR, Form 13, Visit Ticket, vehicle dashboard display, and container seal (see [Fixed-schema document pipeline](#fixed-schema-document-pipeline-eir-form-13-visit-ticket-vehicle-display-container-seal) below).
 
 ## Core design
 
@@ -266,6 +266,145 @@ An unresolved field looks like:
 }
 ```
 
+## Fixed-schema document pipeline (EIR, Form 13, Visit Ticket, vehicle display, container seal)
+
+Beyond the container/portal pipeline above, the service has a second family of
+pipelines for photographed logistics documents: Equipment Interchange
+Reports, Form 13 / E-Gate passes, terminal visit tickets, EV dashboard
+displays, and container seal close-ups. Each has its own route, its own
+fixed field schema, and its own `DocumentExtractionPipeline` instance, all
+sharing the same underlying PaddleOCR and PaddleOCR-VL model instances so
+nothing is loaded twice.
+
+```text
+                    Uploaded document photo
+                               |
+                               v
+                    Image quality check
+                               |
+                               v
+                    Image preprocessing
+                               |
+                    +----------+----------+
+                    |                     |
+              Standard OCR            VLM extraction
+                    |                     |
+                    +----------+----------+
+                               |
+                               v
+                    Sub-type classification
+                     (e.g. EIR: NSFT vs DP World)
+                               |
+                               v
+              Subtype-scoped field list selected
+                               |
+                               v
+        Label-anchored regex extraction, per field,
+           over BOTH the VLM text and the OCR text
+                               |
+                        +------+------+
+                        |             |
+                  both agree     only one found / disagree
+                        |             |
+                  higher confidence   lower confidence /
+                                       flagged for review
+                               |
+                               v
+                    Normalization -> Validation
+                               |
+                               v
+                 Document-specific cross-field checks
+                   (e.g. gate-in must not be after gate-out)
+                               |
+                               v
+                         Manual review
+```
+
+### Why this pipeline differs from the portal/container one
+
+The container/portal pipeline associates a label to a value using OCR
+bounding-box geometry (same row / directly below), which works well for
+clean, consistently-laid-out web screenshots. These documents are
+photographed receipts and multi-column forms with skew, rotation, and
+inconsistent reading order, so spatial heuristics are unreliable here.
+Instead, each field has a **label-anchored regex** (`app/config/document_schemas.py`):
+find the label text, then search a window of text right after it for a
+value matching the field's pattern. A handful of fields with no reliable
+printed label (e.g. an EV dashboard's unlabeled voltage reading) are matched
+by a standalone pattern over the whole text instead.
+
+Because VLM and OCR are run as two independent passes, every field is
+**cross-checked between them** (`app/services/document_text_extractor.py`):
+
+- Found by both, same value → `source: "VLM+OCR"`, high confidence.
+- Found by only one → lower confidence, still returned, but flagged.
+- Found by both with **different** values → the disagreement is reported in
+  `reason` rather than silently picking one -- the same "never invent a
+  value" principle the container/portal pipeline already applies.
+
+### Document types and routes
+
+| Route | Document | Sub-types | Notes |
+|---|---|---|---|
+| `POST /ocr/eir` | Equipment Interchange Report/Receipt | `NSFT`, `DPWORLD` | Two structurally different printed layouts; field list is scoped per subtype after classification. |
+| `POST /ocr/form13` | Form 13 / E-Gate Pass (Form 13/Form 6/SEZ 4) | single layout | Multi-column CARGOES e-gate form. |
+| `POST /ocr/visit-ticket` | Terminal visit ticket | `GTI_DROPOFF_EXPORT`, `GTI_PICKUP_IMPORT`, `DPWORLD_NSICT`, `PSA_BMCT_PICKUP` | Four distinct terminal formats; field list scoped per subtype. Unrecognized layouts fall back to the full field set rather than extracting nothing. |
+| `POST /ocr/vehicle-display` | EV dashboard (SOC %, voltage, odometer) | `EV_DASHBOARD` | See limitation below -- these readings are largely unlabeled. |
+| `POST /ocr/container-seal` | Container seal close-up photo | `SEAL_PHOTO` | Relies primarily on VLM; see limitation below. |
+
+Each route accepts one or more images via the `files` multipart field, the
+same convention as `/analyze`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/ocr/eir \
+  -F "files=@eir1.jpg" \
+  -F "files=@eir2.jpg"
+```
+
+All routes -- `/ocr`, `/analyze`, and the five document routes -- serialize
+through the **same** process-wide lock (`app/routes/_shared.py`). They all
+call into the same shared PaddleOCR/VLM model instances, so a route-local
+lock would only prevent concurrency within one route while still letting
+two different routes run model inference at the same time; that would defeat
+the point.
+
+### Known limitations (read before trusting the output)
+
+- **Vehicle dashboard fields are inherently a heuristic, not a labeled
+  extraction.** Most gauges (SOC, voltage, temperature) are marked by icons,
+  not words, and the dashboard shows two-to-three unlabeled `"...km"`
+  numbers at once. `odometer_km` / `range_to_empty_km` are told apart by
+  "the larger bare integer is the odometer" (true across every sample
+  observed, but a heuristic, not a rule) -- `range_to_empty_km > odometer_km`
+  is cross-validated and flagged, but the pair can still be swapped without
+  tripping that check. Treat this route's output as best-effort telemetry.
+- **Container seal photos are frequently rotated 90-180 degrees.** The
+  shared standard-OCR engine has orientation classification switched off
+  (see `app/services/paddle_engine.py` -- changing it would affect the
+  already-tuned container/portal pipeline), so OCR corroboration is weak on
+  this route. The VLM engine has `use_doc_orientation_classify=True` and
+  `use_seal_recognition=True`, so it carries most of the weight here;
+  without `ENABLE_VLM=true`, expect this route to under-perform.
+  Seal formats also vary by manufacturer with no ISO-equivalent standard,
+  so `seal_number` validation is a loose alphanumeric-with-a-digit check,
+  not a format-specific one.
+- **Visit Ticket has four distinct terminal formats** discovered by
+  inspecting the sample set; a terminal format not seen yet will classify
+  as the closest match or fall back to the full field list. Expect to
+  extend `VISIT_TICKET_CLASSIFY_RULES` / `VISIT_TICKET_FIELDS_BY_SUBTYPE`
+  as new formats show up in real traffic.
+- **Not yet run against live PaddleOCR/PaddleOCR-VL output.** The
+  extraction/normalization/validation/classification logic is tested
+  against text transcribed directly from the real sample documents in
+  `docs/docs/` (see `tests/test_document_extraction.py`), plus one
+  end-to-end run of the real pipeline against a real sample image with
+  stubbed OCR/VLM text. It has not been run against actual model inference
+  output, since `paddleocr` requires a dependency install this environment
+  couldn't reach. Before relying on this in production, run each route
+  against a batch of the real sample images with `ENABLE_VLM=true` and
+  `SAVE_DEBUG_OUTPUT=true`, and compare the extracted fields against the
+  source photos.
+
 ## API
 
 ### Health
@@ -345,6 +484,8 @@ Tests cover:
 - phone normalization/validation
 - container-count conflicts
 - transaction/export conflicts
+- field-extraction exclusivity and the VLM run-once-per-image fix (`test_pipeline_fixes.py`)
+- document field extraction for EIR/Form 13/Visit Ticket/vehicle display/container seal, against text transcribed from the real sample documents, plus the new `date`/`datetime`/`weight`/`percentage`/`voltage`/`temperature`/`seal_number`/strict `truck_registration` kinds (`test_document_extraction.py`)
 
 ## Important production limitation
 

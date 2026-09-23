@@ -1,6 +1,6 @@
 {
   "project": "container-seal-ocr",
-  "description": "Sequential portal screenshot extraction and specialized ISO 6346 container OCR service.",
+  "description": "Sequential portal screenshot extraction, specialized ISO 6346 container OCR, and a VLM+OCR hybrid fixed-schema pipeline for EIR, Form 13, Visit Ticket, vehicle display, and container seal documents.",
   "files": [
     ".env.example",
     ".gitignore",
@@ -10,13 +10,17 @@
     "app/main.py",
     "app/config/__init__.py",
     "app/config/field_rules.py",
+    "app/config/document_schemas.py",
     "app/dependencies.py",
     "app/routes/__init__.py",
+    "app/routes/_shared.py",
     "app/routes/ocr.py",
+    "app/routes/documents.py",
     "app/schemas/__init__.py",
     "app/schemas/extraction.py",
     "app/services/__init__.py",
     "app/services/paddle_engine.py",
+    "app/services/vlm_engine.py",
     "app/services/general_ocr.py",
     "app/services/ocr_service.py",
     "app/services/container_ocr_adapter.py",
@@ -31,6 +35,10 @@
     "app/services/status_detector.py",
     "app/services/table_extractor.py",
     "app/services/pipeline.py",
+    "app/services/document_classifier.py",
+    "app/services/document_text_extractor.py",
+    "app/services/document_cross_validators.py",
+    "app/services/document_pipeline.py",
     "app/utils/__init__.py",
     "app/utils/candidates.py",
     "app/utils/iso6346.py",
@@ -40,6 +48,8 @@
     "pytest.ini",
     "run.py",
     "tests/test_iso6346.py",
-    "tests/test_validation.py"
+    "tests/test_validation.py",
+    "tests/test_pipeline_fixes.py",
+    "tests/test_document_extraction.py"
   ]
 }
