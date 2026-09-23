@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import OUTPUT_DIR, SAVE_DEBUG_OUTPUT
-from app.config.field_rules import FIELD_RULES
+from app.config.field_rules import FIELD_RULES, SCREEN_FIELDS
 from app.schemas.extraction import FieldResult, ImageResult
 from app.services.confidence import ConfidenceEngine
 from app.services.container_ocr_adapter import ContainerOCRAdapter
@@ -71,7 +71,7 @@ class SequentialExtractionPipeline:
         container_result = None
         # The specialized service is called once per image. It remains useful for container photos
         # and for screenshots where a container number is a target field.
-        if self._container_expected(screen["screen_type"], fields):
+        if self._container_expected(screen["screen_type"]):
             container_result = self.container_ocr.extract(image_path)
             self._merge_container_result(fields, container_result)
 
@@ -108,13 +108,18 @@ class SequentialExtractionPipeline:
         return image_result
 
     @staticmethod
-    def _container_expected(screen_type: str, fields: dict) -> bool:
-        if screen_type == "UNKNOWN":
-            return True
-        return any(
-            name.startswith(("export_container", "dpd_container")) and field.get("value")
-            for name, field in fields.items()
-        ) or screen_type in {"PIN_GENERATION_PSA", "PIN_GENERATION_APM", "PIN_GENERATION_NSFT", "TRUCK_BOOKING_NSFT"}
+    def _container_expected(screen_type: str) -> bool:
+        """Only run the specialized container OCR pass when this screen's field
+        schema actually includes a container-number field.
+
+        This used to unconditionally return True for every known screen type
+        (the screen_type membership check made the rest of the condition
+        dead code), so every image paid for a second full preprocessing +
+        base-OCR pass even on screens with no container field at all, such
+        as PIN_GENERATION_APM.
+        """
+        field_names = SCREEN_FIELDS.get(screen_type, SCREEN_FIELDS["UNKNOWN"])
+        return any(FIELD_RULES.get(name, {}).get("kind") == "container" for name in field_names)
 
     @staticmethod
     def _merge_container_result(fields: dict, result: dict | None) -> None:
@@ -179,13 +184,20 @@ class SequentialExtractionPipeline:
         if self.vlm.vlm is None:
             return
         # Verify only high-risk unresolved fields. Do not let VLM override a valid deterministic result.
-        for item in list(manual_review):
-            name = item["field"]
-            rule = FIELD_RULES.get(name, {})
-            if rule.get("risk") != "high":
-                continue
+        pending = [item["field"] for item in manual_review if FIELD_RULES.get(item["field"], {}).get("risk") == "high"]
+        if not pending:
+            return
+        # Run the (expensive) VLM prediction exactly once per image and reuse
+        # the extracted text for every pending field, instead of re-running
+        # the full VLM pass once per field (previously up to one pass per
+        # unresolved high-risk field, and this schema has 14 of those).
+        extraction = self.vlm.extract_text(image_path)
+        if not extraction.get("available") or extraction.get("error"):
+            return
+        text = extraction["text"]
+        for name in pending:
             current = fields.get(name, {}).get("value")
-            result = self.vlm.verify_field(image_path, name, current)
+            result = self.vlm.match_field(text, name, current)
             if result.get("status") == "MATCH" and current:
                 validation = fields[name].get("validation", {})
                 if validation.get("valid"):

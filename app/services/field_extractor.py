@@ -27,6 +27,7 @@ class FieldExtractor:
         field_names = SCREEN_FIELDS.get(screen_type, SCREEN_FIELDS["UNKNOWN"])
         label_indices = {i for i, item in enumerate(items) if self._is_any_label(item.get("text", ""))}
         fields: dict[str, dict[str, Any]] = {}
+        pending: list[tuple[str, int, dict]] = []
 
         for field_name in field_names:
             rule = FIELD_RULES[field_name]
@@ -58,15 +59,44 @@ class FieldExtractor:
                 }
                 continue
 
-            candidate = self._nearest_value(label_index, label, items, label_indices)
-            if candidate is None:
-                fields[field_name] = {
-                    "value": None, "confidence": None, "status": "EMPTY", "source": "SYSTEM",
-                    "bbox": list(label_box) if label_box else None,
-                    "reason": "Field label was found but no nearby value was detected.",
-                }
-                continue
+            pending.append((field_name, label_index, label))
 
+        self._assign_values(pending, items, label_indices, fields)
+        return fields
+
+    @classmethod
+    def _assign_values(
+        cls,
+        pending: list[tuple[str, int, dict]],
+        items: list[dict],
+        label_indices: set[int],
+        fields: dict[str, dict[str, Any]],
+    ) -> None:
+        """Assign OCR value candidates to labels as one global, exclusive match.
+
+        Each field used to search for its nearest value independently, with
+        no notion of what any other field already claimed. That let a field
+        whose own value cell was genuinely blank fall through to its "below
+        label" search and grab a value that actually belonged to the row
+        underneath it. Scoring every (field, candidate) pair once and
+        assigning greedily by ascending distance fixes that: the true owner
+        of a same-row value always has a smaller distance than a different
+        field's below-row fallback to that same box, so it is claimed first.
+        """
+        scored: list[tuple[float, str, int, dict]] = []
+        for field_name, label_index, label in pending:
+            for candidate_index, score in cls._scored_candidates(label_index, label, items, label_indices):
+                scored.append((score, field_name, candidate_index, items[candidate_index]))
+
+        scored.sort(key=lambda entry: entry[0])
+        assigned: set[str] = set()
+        used_index: set[int] = set()
+
+        for score, field_name, candidate_index, candidate in scored:
+            if field_name in assigned or candidate_index in used_index:
+                continue
+            assigned.add(field_name)
+            used_index.add(candidate_index)
             fields[field_name] = {
                 "value": candidate["text"],
                 "confidence": candidate["confidence"],
@@ -74,7 +104,15 @@ class FieldExtractor:
                 "bbox": candidate.get("box"),
             }
 
-        return fields
+        for field_name, label_index, label in pending:
+            if field_name in assigned:
+                continue
+            label_box = _box(label)
+            fields[field_name] = {
+                "value": None, "confidence": None, "status": "EMPTY", "source": "SYSTEM",
+                "bbox": list(label_box) if label_box else None,
+                "reason": "Field label was found but no nearby value was detected.",
+            }
 
     @classmethod
     def _is_any_label(cls, text: str) -> bool:
@@ -122,13 +160,28 @@ class FieldExtractor:
         return None
 
     @staticmethod
-    def _nearest_value(label_index: int, label: dict, items: list[dict], label_indices: set[int]) -> dict | None:
+    def _scored_candidates(
+        label_index: int, label: dict, items: list[dict], label_indices: set[int]
+    ) -> list[tuple[int, float]]:
+        """Return every plausible value candidate for a label as (item index, score).
+
+        The caller performs the actual assignment globally across all fields
+        (see _assign_values) so that a lower-scored same-row match for one
+        field always wins over a different field's higher-scored below-row
+        fallback to the same box.
+        """
         lb = _box(label)
         if not lb:
-            return None
+            return []
         lx1, ly1, lx2, ly2 = lb
         lcy = (ly1 + ly2) / 2
-        candidates = []
+        # The below-label fallback used to accept anything within a flat 180px,
+        # which can reach a full row or more past a genuinely blank value cell
+        # and grab the next field's real value instead. Scale it to the
+        # label's own text height so it stays roughly within one row.
+        label_height = max(1.0, ly2 - ly1)
+        below_limit = min(180.0, 1.6 * label_height)
+        candidates: list[tuple[int, float]] = []
 
         for index, item in enumerate(items):
             if index == label_index or index in label_indices:
@@ -149,9 +202,8 @@ class FieldExtractor:
             dy = abs(icy - lcy)
 
             if same_row and right_of_label and dx <= 900:
-                candidates.append((dx + dy * 2, item))
-            elif below_label and abs((x1 + x2) / 2 - (lx1 + lx2) / 2) <= 450 and (y1 - ly2) <= 180:
-                candidates.append(((y1 - ly2) * 2 + abs((x1 + x2) / 2 - (lx1 + lx2) / 2), item))
+                candidates.append((index, dx + dy * 2))
+            elif below_label and abs((x1 + x2) / 2 - (lx1 + lx2) / 2) <= 450 and (y1 - ly2) <= below_limit:
+                candidates.append((index, (y1 - ly2) * 2 + abs((x1 + x2) / 2 - (lx1 + lx2) / 2)))
 
-        candidates.sort(key=lambda pair: pair[0])
-        return candidates[0][1] if candidates else None
+        return candidates

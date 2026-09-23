@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.config import ENABLE_VLM, OUTPUT_DIR, SAVE_DEBUG_OUTPUT, VLM_VERSION
+from app.config import OUTPUT_DIR, SAVE_DEBUG_OUTPUT
 from app.services.paddle_engine import PaddleOCREngine
+from app.services.vlm_engine import VLMEngine
 from app.utils.candidates import (
     extract_from_json_objects,
     extract_iso_candidates,
@@ -19,30 +20,14 @@ from app.utils.preprocessing import preprocess_image
 class ContainerOCRService:
     """Specialized container-number OCR: standard PaddleOCR first, optional VLM fallback."""
 
-    def __init__(self, engine: PaddleOCREngine | None = None) -> None:
+    def __init__(self, engine: PaddleOCREngine | None = None, vlm_engine: VLMEngine | None = None) -> None:
         self.engine = engine or PaddleOCREngine()
         self.ocr = self.engine.ocr
         self.ocr_error = self.engine.error
-        self.vlm = None
-        self.vlm_error = None
-        if ENABLE_VLM:
-            self._load_vlm()
-
-    def _load_vlm(self) -> None:
-        try:
-            from paddleocr import PaddleOCRVL
-            self.vlm = PaddleOCRVL(
-                pipeline_version=VLM_VERSION,
-                use_layout_detection=True,
-                use_seal_recognition=True,
-                use_doc_orientation_classify=True,
-                use_doc_unwarping=True,
-                use_ocr_for_image_block=True,
-            )
-            print(f"[startup] Optional PaddleOCR-VL {VLM_VERSION} loaded for container fallback.")
-        except Exception as exc:  # pragma: no cover
-            self.vlm_error = str(exc)
-            print(f"[startup] Optional PaddleOCR-VL unavailable: {exc}")
+        # Shared VLM instance (see VLMEngine) rather than loading a second
+        # PaddleOCR-VL model independently of the general field verifier.
+        self.vlm = vlm_engine.vlm if vlm_engine else None
+        self.vlm_error = vlm_engine.error if vlm_engine else "VLM is disabled."
 
     @staticmethod
     def _save_json(path: Path, data: Any) -> None:

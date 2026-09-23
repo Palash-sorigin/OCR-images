@@ -2,35 +2,26 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.config import ENABLE_VLM, VLM_VERSION
+from app.services.vlm_engine import VLMEngine
 from app.utils.candidates import extract_iso_candidates
 
 
 class VLMVerifier:
-    """Optional, safe VLM fallback. It never overrides deterministic validation by itself."""
+    """Optional, safe VLM fallback. It never overrides deterministic validation by itself.
 
-    def __init__(self) -> None:
-        self.vlm = None
-        self.error: str | None = None
-        if ENABLE_VLM:
-            try:
-                from paddleocr import PaddleOCRVL
-                self.vlm = PaddleOCRVL(
-                    pipeline_version=VLM_VERSION,
-                    use_layout_detection=True,
-                    use_seal_recognition=True,
-                    use_doc_orientation_classify=True,
-                    use_doc_unwarping=True,
-                    use_ocr_for_image_block=True,
-                )
-                print(f"[startup] Optional PaddleOCR-VL {VLM_VERSION} loaded.")
-            except Exception as exc:  # pragma: no cover
-                self.error = str(exc)
-                print(f"[startup] Optional PaddleOCR-VL unavailable: {exc}")
+    extract_text() runs the (expensive) VLM prediction exactly once. Callers
+    that need to check several fields against the same image should call it
+    once and pass the resulting text into match_field() for each field,
+    instead of re-running the VLM per field.
+    """
 
-    def verify_field(self, image_path: Path, field_name: str, expected_value: str | None = None) -> dict:
+    def __init__(self, engine: VLMEngine | None = None) -> None:
+        self.vlm = engine.vlm if engine else None
+        self.error: str | None = engine.error if engine else "VLM is disabled."
+
+    def extract_text(self, image_path: Path) -> dict:
         if self.vlm is None:
-            return {"available": False, "status": "NOT_CONFIGURED", "field": field_name, "reason": self.error or "VLM is disabled."}
+            return {"available": False, "text": "", "raw": [], "error": self.error or "VLM is disabled."}
 
         try:
             results = self.vlm.predict(str(image_path))
@@ -48,17 +39,18 @@ class VLMVerifier:
                     if content:
                         text_parts.append(str(content))
 
-            text = "\n".join(text_parts)
-            matched = bool(expected_value and expected_value.upper() in text.upper())
-            iso_candidates = extract_iso_candidates(text)
-            return {
-                "available": True,
-                "status": "MATCH" if matched else "NO_MATCH",
-                "field": field_name,
-                "expected_value": expected_value,
-                "matched": matched,
-                "iso_candidates": iso_candidates,
-                "raw": raw,
-            }
+            return {"available": True, "text": "\n".join(text_parts), "raw": raw, "error": None}
         except Exception as exc:  # pragma: no cover
-            return {"available": True, "status": "ERROR", "field": field_name, "error": str(exc)}
+            return {"available": True, "text": "", "raw": [], "error": str(exc)}
+
+    @staticmethod
+    def match_field(text: str, field_name: str, expected_value: str | None = None) -> dict:
+        matched = bool(expected_value and expected_value.upper() in text.upper())
+        return {
+            "available": True,
+            "status": "MATCH" if matched else "NO_MATCH",
+            "field": field_name,
+            "expected_value": expected_value,
+            "matched": matched,
+            "iso_candidates": extract_iso_candidates(text),
+        }

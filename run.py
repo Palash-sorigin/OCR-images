@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from app.services.ocr_service import ContainerOCRService
+from app.services.vlm_engine import VLMEngine
 
 
 def main():
@@ -17,7 +18,7 @@ def main():
     if not image_path.exists():
         raise SystemExit(f"Image not found: {image_path}")
 
-    service = ContainerOCRService()
+    service = ContainerOCRService(vlm_engine=VLMEngine())
     result = service.process(image_path)
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
