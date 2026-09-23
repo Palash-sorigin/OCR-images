@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.config import ENABLE_LLM_EXTRACTION
 from app.config.document_schemas import DOCUMENT_TYPES
 from app.services.container_ocr_adapter import ContainerOCRAdapter
 from app.services.container_ocr_service_factory import build_container_ocr_service
@@ -13,6 +14,7 @@ from app.services.vlm_verifier import VLMVerifier
 
 paddle_engine: PaddleOCREngine | None = None
 vlm_engine: VLMEngine | None = None
+gemini_engine = None
 container_ocr_service = None
 general_ocr_service = None
 container_ocr_adapter = None
@@ -22,7 +24,8 @@ document_pipelines: dict[str, DocumentExtractionPipeline] = {}
 
 
 def initialize_services() -> None:
-    global paddle_engine, vlm_engine, container_ocr_service, general_ocr_service
+    global paddle_engine, vlm_engine, gemini_engine
+    global container_ocr_service, general_ocr_service
     global container_ocr_adapter, vlm_verifier, pipeline, document_pipelines
 
     if pipeline is not None:
@@ -40,20 +43,38 @@ def initialize_services() -> None:
     vlm_verifier = VLMVerifier(vlm_engine)
     pipeline = SequentialExtractionPipeline(general_ocr_service, container_ocr_adapter, vlm_verifier)
 
+    # Gemini Flash LLM engine — only loaded when the OCR+LLM path is enabled.
+    # Shared across all document pipelines that opt in (currently: visit_ticket).
+    if ENABLE_LLM_EXTRACTION:
+        from app.services.gemini_llm_engine import GeminiLLMEngine
+        from app.services.ocr_candidate_builder import build_candidates  # noqa: F401 — import validates the module
+        gemini_engine = GeminiLLMEngine()
+    else:
+        gemini_engine = None
+
     # One DocumentExtractionPipeline per fixed schema (EIR, Form 13, Visit
     # Ticket, vehicle display, container seal), all sharing the same OCR/VLM
     # engines so no model is loaded more than once.
-    document_pipelines = {
-        document_type: DocumentExtractionPipeline(document_type, general_ocr_service, vlm_verifier)
-        for document_type in DOCUMENT_TYPES
-    }
+    # The visit_ticket pipeline additionally receives the Gemini engine and
+    # candidate builder so it can use the cheaper OCR+LLM path.
+    document_pipelines = {}
+    for document_type in DOCUMENT_TYPES:
+        extra_kwargs = {}
+        if document_type == "visit_ticket" and gemini_engine is not None:
+            extra_kwargs["gemini_engine"] = gemini_engine
+            extra_kwargs["candidate_builder"] = True  # signals availability
+        document_pipelines[document_type] = DocumentExtractionPipeline(
+            document_type, general_ocr_service, vlm_verifier, **extra_kwargs
+        )
 
 
 def shutdown_services() -> None:
-    global paddle_engine, vlm_engine, container_ocr_service, general_ocr_service
+    global paddle_engine, vlm_engine, gemini_engine
+    global container_ocr_service, general_ocr_service
     global container_ocr_adapter, vlm_verifier, pipeline, document_pipelines
     paddle_engine = None
     vlm_engine = None
+    gemini_engine = None
     container_ocr_service = None
     general_ocr_service = None
     container_ocr_adapter = None
@@ -80,3 +101,4 @@ def get_document_pipeline(document_type: str) -> DocumentExtractionPipeline:
     if document_type not in document_pipelines:
         raise RuntimeError(f"Unknown document type: {document_type}")
     return document_pipelines[document_type]
+
