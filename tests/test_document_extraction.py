@@ -119,6 +119,20 @@ Yard Loc :Read SMS
 Remark :
 """
 
+VISIT_TICKET_GTI_PICKUP_TEXT = """
+GATEWAY TERMINALS INDIA PVT.LTD
+Pick-Up Ticket-Import
+Date : 09-08-2026 19:34
+Trailer No:MH03FC0371
+Bat Id :CY30
+Cntr No :TGBU8932660
+ISO Code :4400
+Yard Loc :03J24A.2
+Gross Wt :28.52
+Seal No 1 :40343856
+Group Code:ULA
+"""
+
 VISIT_TICKET_PSA_TEXT = """
 PSA MUMBA
 BMCT-TID

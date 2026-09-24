@@ -20,9 +20,20 @@ OCR_REVIEW_THRESHOLD = float(os.getenv("OCR_REVIEW_THRESHOLD", "0.70"))
 VLM_CONFIDENCE_THRESHOLD = float(os.getenv("VLM_CONFIDENCE_THRESHOLD", "0.85"))
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(15 * 1024 * 1024)))
 
-# Gemini Flash LLM — used for Visit Ticket OCR+LLM extraction instead of
-# the heavier PaddleOCR-VL pipeline.  Set ENABLE_LLM_EXTRACTION=false to
-# fall back to the VLM+OCR hybrid path.
+# Gemini Flash-Lite LLM — used for Visit Ticket OCR+image+LLM extraction
+# instead of the much heavier PaddleOCR-VL pipeline (which measured at
+# 3-7 minutes/image on CPU; Gemini Flash-Lite is a hosted multimodal model
+# sized for low-latency, high-throughput document parsing). Set
+# ENABLE_LLM_EXTRACTION=false to disable and use fast OCR-only extraction.
+#
+# IMPORTANT: unlike every other model in this project, this one is NOT
+# self-hosted. Enabling it sends the document image and its OCR text to
+# Google's Gemini API. Confirm that is acceptable for your data before
+# turning this on for real documents.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 ENABLE_LLM_EXTRACTION = os.getenv("ENABLE_LLM_EXTRACTION", "true").lower() == "true"
+# Hard ceiling on the Gemini call itself. On timeout, the pipeline falls
+# back to fast OCR-only extraction rather than blocking -- see
+# GeminiLLMEngine.extract_fields and DocumentExtractionPipeline._process_with_llm.
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "12"))

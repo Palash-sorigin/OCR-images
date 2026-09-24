@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +33,15 @@ class DocumentExtractionPipeline:
     VLM and OCR are run independently and cross-checked per field -- see
     document_text_extractor.extract_fields for the agreement logic.
 
-    For ``visit_ticket`` documents when ``ENABLE_LLM_EXTRACTION`` is true,
-    the VLM is bypassed entirely: raw OCR candidates are built and sent
-    (as text, no image) to Gemini Flash, which selects the best value per
-    field.  This is dramatically cheaper while preserving accuracy.
+    For ``visit_ticket`` documents when ``ENABLE_LLM_EXTRACTION`` is true and
+    a Gemini engine is configured, the VLM is bypassed entirely: the
+    document image AND OCR-derived candidates are sent together to Gemini
+    Flash-Lite, which selects the best value per field using the image for
+    visual grounding. Every returned value is independently re-verified
+    against the actual OCR text (see GeminiLLMEngine._validate_response) --
+    the LLM can never introduce a value OCR didn't detect. If Gemini is
+    unavailable, times out, or errors, this falls back to fast local
+    OCR-only regex extraction, never to the slow VLM path.
     """
 
     def __init__(
@@ -45,7 +51,6 @@ class DocumentExtractionPipeline:
         vlm: VLMVerifier,
         *,
         gemini_engine=None,
-        candidate_builder=None,
     ) -> None:
         if document_type not in DOCUMENT_TYPES:
             raise ValueError(f"Unknown document type: {document_type}")
@@ -60,9 +65,8 @@ class DocumentExtractionPipeline:
         self.validator = FieldValidator()
         self.confidence = ConfidenceEngine()
 
-        # OCR + LLM path (visit_ticket only when enabled)
+        # OCR + image + LLM path (visit_ticket only when enabled)
         self.gemini_engine = gemini_engine
-        self.candidate_builder = candidate_builder
         self._use_llm = (
             ENABLE_LLM_EXTRACTION
             and document_type == "visit_ticket"
@@ -87,19 +91,28 @@ class DocumentExtractionPipeline:
         return results
 
     def process_one(self, filename: str, image_path: Path) -> ImageResult:
+        request_start = time.perf_counter()
+        print(f"[{self.document_type}] === start: {filename} ===")
+
         quality = inspect_image_quality(image_path)
         if quality["status"] == "UNREADABLE":
+            print(f"[{self.document_type}] ABORT: image unreadable ({quality['reason']})")
             return ImageResult(
                 filename=filename, status="ERROR", document_type=self.document_type,
                 quality=quality, warnings=[quality["reason"]],
             )
 
+        t = time.perf_counter()
         processed_path = preprocess_image(image_path, OUTPUT_DIR)
-        print("[1/6] Image preprocessing")
+        print(f"[{self.document_type}] [1/6] preprocessing done in {time.perf_counter() - t:.2f}s")
+
+        t = time.perf_counter()
         ocr_result = self.general_ocr.extract(processed_path)
+        print(f"[{self.document_type}] [2/6] OCR done in {time.perf_counter() - t:.2f}s "
+              f"({len(ocr_result['items'])} text items)")
 
         if self._use_llm:
-            fields, subtype = self._process_with_llm(ocr_result)
+            fields, subtype = self._process_with_llm(ocr_result, processed_path)
         else:
             fields, subtype = self._process_with_vlm(ocr_result, image_path)
 
@@ -107,12 +120,13 @@ class DocumentExtractionPipeline:
             vlm_text = "" if self._use_llm else self._vlm_text(image_path)
             self._resolve_km_readings(fields, f"{vlm_text}\n{ocr_result['text']}")
 
-        print("[5/6] Normalization + validation")
+        t = time.perf_counter()
         self._normalize_fields(fields)
         self._validate_fields(fields)
         conflicts = cross_validate(self.document_type, fields)
-        print("[6/6] Manual review")
         manual_review = self._build_manual_review(fields, conflicts)
+        print(f"[{self.document_type}] [5/6] normalize+validate+cross-check done in "
+              f"{time.perf_counter() - t:.3f}s ({len(manual_review)} items need review)")
 
         status = "NEEDS_REVIEW" if manual_review or conflicts else "PROCESSED"
         image_result = ImageResult(
@@ -129,35 +143,57 @@ class DocumentExtractionPipeline:
             raw_ocr=ocr_result["items"],
         )
         if SAVE_DEBUG_OUTPUT:
+            t = time.perf_counter()
             self._save_debug(filename, image_path, image_result.model_dump())
+            print(f"[{self.document_type}] [6/6] debug JSON written in {time.perf_counter() - t:.3f}s")
+
+        total = time.perf_counter() - request_start
+        print(f"[{self.document_type}] === done: {filename} in {total:.2f}s -> status={status} ===")
         return image_result
 
-    # ── OCR + LLM path (visit_ticket) ──────────────────────────────────────
+    # ── OCR + image + LLM path (visit_ticket, when Gemini is configured) ────
 
     def _process_with_llm(
-        self, ocr_result: dict,
+        self, ocr_result: dict, image_path: Path,
     ) -> tuple[dict[str, dict[str, Any]], dict]:
-        """Run the cheap OCR-only + Gemini Flash path."""
-        from app.services.ocr_candidate_builder import (
-            build_candidates,
-            build_llm_context,
-        )
+        """OCR + image sent together to Gemini Flash-Lite, with a hard
+        timeout. On any failure (unavailable/timeout/error), falls back to
+        fast OCR-only extraction -- never to the slow VLM path."""
+        from app.services.ocr_candidate_builder import build_candidates, build_llm_context
 
-        print("[2/6] Skipping VLM (using OCR + LLM path)")
-        print("[3/6] Sub-type classification (OCR-only)")
+        print(f"[{self.document_type}] [3/6] LLM path: classifying + building candidates")
+        t = time.perf_counter()
         subtype = self.classifier.classify(ocr_result["text"])
         active_fields = self._fields_for_subtype(subtype["subtype"])
-
-        print("[4/6] Building candidates + LLM extraction")
         candidates = build_candidates(ocr_result["items"], active_fields)
-        context = build_llm_context(
-            ocr_result, active_fields, subtype["subtype"], candidates,
-        )
-        llm_result = self.gemini_engine.extract_fields(context, active_fields)
+        context = build_llm_context(ocr_result, active_fields, subtype["subtype"], candidates)
+        print(f"[{self.document_type}] [3/6] subtype={subtype['subtype']} "
+              f"candidates built in {time.perf_counter() - t:.3f}s "
+              f"({sum(len(c['candidates']) for c in candidates.values())} high-confidence, "
+              f"{sum(len(c['possible_candidates']) for c in candidates.values())} possible)")
 
-        fields = self._build_fields_from_llm(
-            llm_result, candidates, ocr_result["items"],
-        )
+        llm_result, meta = self.gemini_engine.extract_fields(image_path, context, active_fields)
+
+        if meta["status"] != "OK":
+            print(f"[{self.document_type}] [4/6] LLM path did not complete "
+                  f"(status={meta['status']}); falling back to fast OCR-only extraction")
+            return self._process_with_ocr_only(ocr_result, subtype, active_fields)
+
+        print(f"[4/6] LLM path succeeded in {meta['elapsed_s']:.2f}s")
+        fields = self._build_fields_from_llm(llm_result, candidates, ocr_result["items"])
+        return fields, subtype
+
+    def _process_with_ocr_only(
+        self, ocr_result: dict, subtype: dict, active_fields: dict[str, dict],
+    ) -> tuple[dict[str, dict[str, Any]], dict]:
+        """Fast, fully local fallback: the same label-anchored regex
+        extraction used for the other document types, with no VLM and no
+        network call. This is what the LLM path degrades to on any
+        failure, so a Gemini outage or missing API key never turns into a
+        multi-minute VLM response."""
+        t = time.perf_counter()
+        fields = extract_fields(active_fields, vlm_text="", ocr_text=ocr_result["text"], ocr_items=ocr_result["items"])
+        print(f"[{self.document_type}] [4/6] OCR-only fallback extraction done in {time.perf_counter() - t:.3f}s")
         return fields, subtype
 
     # ── VLM + OCR hybrid path (all other document types) ───────────────────
@@ -166,19 +202,23 @@ class DocumentExtractionPipeline:
         self, ocr_result: dict, image_path: Path,
     ) -> tuple[dict[str, dict[str, Any]], dict]:
         """Run the existing VLM+OCR cross-check path."""
-        print("[2/6] VLM extraction")
+        t = time.perf_counter()
         vlm_text = self._vlm_text(image_path)
-        print("[3/6] Sub-type classification")
+        print(f"[{self.document_type}] [3/6] VLM extraction done in {time.perf_counter() - t:.2f}s "
+              f"({len(vlm_text)} chars)" if self.vlm.vlm is not None else
+              f"[{self.document_type}] [3/6] VLM not configured, skipped")
         combined_for_classify = f"{ocr_result['text']}\n{vlm_text}"
         subtype = self.classifier.classify(combined_for_classify)
-        print("[4/6] Field extraction (VLM + OCR cross-check)")
         active_fields = self._fields_for_subtype(subtype["subtype"])
+        t = time.perf_counter()
         fields = extract_fields(
             active_fields,
             vlm_text=vlm_text,
             ocr_text=ocr_result["text"],
             ocr_items=ocr_result["items"],
         )
+        print(f"[{self.document_type}] [4/6] field extraction done in {time.perf_counter() - t:.3f}s, "
+              f"subtype={subtype['subtype']}")
         return fields, subtype
 
     # ── LLM result → field dicts ───────────────────────────────────────────

@@ -65,7 +65,9 @@ def build_candidates(
                     (candidates if conf >= _HIGH_CONF else possible).append(entry)
 
         # Also scan the combined OCR text for label-anchored matches that
-        # span two adjacent OCR items (label in one item, value in the next).
+        # span two adjacent OCR items (label in one item, value in the
+        # next) -- the common case for photographed receipts, where a
+        # label and its value are almost always two separate OCR boxes.
         combined = "\n".join(str(it.get("text", "")) for it in ocr_items)
         if label_re:
             for lm in label_re.finditer(combined):
@@ -74,8 +76,21 @@ def build_candidates(
                 if vm:
                     val = vm.group(1) if vm.groups() else vm.group(0)
                     val = val.strip()
-                    # Avoid duplicates already found per-item.
-                    if not _already_found(val, candidates, possible):
+                    if _already_found(val, candidates, possible):
+                        continue
+                    # Try to trace the matched value back to the specific
+                    # OCR item it came from, so it gets that item's real
+                    # confidence/index/bbox instead of a flat placeholder.
+                    # Without this, every cross-item match -- the majority
+                    # of real fields -- would land in the weaker
+                    # possible_candidates bucket with a synthetic 0.70
+                    # score, understating the true OCR confidence.
+                    owner = _find_owning_item(val, ocr_items)
+                    if owner is not None:
+                        idx, item = owner
+                        entry = _entry(val, float(item.get("confidence", 0.70)), idx, item.get("box"), anchored=True)
+                        (candidates if entry["confidence"] >= _HIGH_CONF else possible).append(entry)
+                    else:
                         entry = _entry(val, 0.70, -1, None, anchored=True)
                         possible.append(entry)
 
@@ -157,6 +172,18 @@ def _entry(value: str, confidence: float, ocr_index: int, bbox, *, anchored: boo
         "bbox": bbox,
         "label_anchored": anchored,
     }
+
+
+def _find_owning_item(value: str, ocr_items: list[dict]) -> tuple[int, dict] | None:
+    """Find the OCR item whose own text contains (or equals) `value`."""
+    compact = re.sub(r"[^A-Z0-9]", "", value.upper())
+    if not compact:
+        return None
+    for idx, item in enumerate(ocr_items):
+        item_compact = re.sub(r"[^A-Z0-9]", "", str(item.get("text", "")).upper())
+        if item_compact and compact in item_compact:
+            return idx, item
+    return None
 
 
 def _already_found(value: str, *lists: list[dict]) -> bool:

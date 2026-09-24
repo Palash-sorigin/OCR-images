@@ -62,7 +62,6 @@ def initialize_services() -> None:
         extra_kwargs = {}
         if document_type == "visit_ticket" and gemini_engine is not None:
             extra_kwargs["gemini_engine"] = gemini_engine
-            extra_kwargs["candidate_builder"] = True  # signals availability
         document_pipelines[document_type] = DocumentExtractionPipeline(
             document_type, general_ocr_service, vlm_verifier, **extra_kwargs
         )

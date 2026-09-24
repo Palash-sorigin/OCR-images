@@ -349,7 +349,15 @@ VISIT_TICKET_FIELDS = {
 }
 
 VISIT_TICKET_CLASSIFY_RULES = {
-    "GTI_DROPOFF_EXPORT": ["DROP-OFF TICKET-EXPORT", "GATEWAY TERMINALS"],
+    # "GATEWAY TERMINALS" is deliberately NOT a keyword here: it's the
+    # shared company header printed on BOTH GTI_DROPOFF_EXPORT and
+    # GTI_PICKUP_IMPORT tickets, so including it caused a scoring tie on
+    # pickup tickets (which also match this rule's other keyword's
+    # absence) that resolved to the wrong subtype via dict iteration
+    # order, silently skipping seal_no_1/seal_no_2/group_code extraction
+    # on real pickup tickets. "DROP-OFF TICKET-EXPORT" alone is already
+    # a fully unambiguous signal.
+    "GTI_DROPOFF_EXPORT": ["DROP-OFF TICKET-EXPORT"],
     "GTI_PICKUP_IMPORT": ["PICK-UP TICKET-IMPORT"],
     "DPWORLD_NSICT": ["DP WORLD NHAVA SHEVA ICT", "NSICT"],
     "PSA_BMCT_PICKUP": ["PSA MUMBA", "BMCT-TID"],
