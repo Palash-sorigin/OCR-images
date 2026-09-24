@@ -5,4 +5,5 @@ pillow
 python-dotenv
 paddlepaddle
 paddleocr[doc-parser]
+google-genai
 pytest

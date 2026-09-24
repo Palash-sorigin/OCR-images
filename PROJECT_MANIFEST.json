@@ -39,6 +39,8 @@
     "app/services/document_text_extractor.py",
     "app/services/document_cross_validators.py",
     "app/services/document_pipeline.py",
+    "app/services/ocr_candidate_builder.py",
+    "app/services/gemini_llm_engine.py",
     "app/utils/__init__.py",
     "app/utils/candidates.py",
     "app/utils/iso6346.py",
